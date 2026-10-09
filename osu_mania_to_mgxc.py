@@ -6,6 +6,7 @@ import uuid
 import shutil
 from pathlib import Path
 from typing import List, Dict, Tuple
+from PIL import Image
 KEY_CNT_TO_KEY_WIDTH_MAPPING = {
     1: {0: (0, 16)},
     2: {0: (0, 8), 1: (8, 8)},
@@ -59,6 +60,50 @@ def getBackgroundFilename(osuFilename, data):
                 (sourceDir / videoPath).is_file()):
             return videoFilename
     return data.background_file
+
+
+def createJacket(osuFilename, mgxcFilename, data):
+    sourceDir = Path(osuFilename).resolve().parent
+    backgroundPath = Path(data.background_file)
+    if not data.background_file:
+        pErr(f'WARNING: no background image found for {Path(osuFilename).name}')
+        return ''
+    if backgroundPath.is_absolute() or '..' in backgroundPath.parts:
+        pErr(f'WARNING: skipping unsafe background path: {data.background_file}')
+        return ''
+
+    sourcePath = sourceDir / backgroundPath
+    if not sourcePath.is_file():
+        pErr(f'WARNING: background image not found: {sourcePath}')
+        return ''
+
+    imageExtension = sourcePath.suffix.lower()
+    if imageExtension not in ('.jpg', '.jpeg', '.png'):
+        pErr(f'WARNING: jacket image must be JPG or PNG: {sourcePath}')
+        return ''
+
+    mgxcPath = Path(mgxcFilename)
+    jacketFilename = f'jacket{sourcePath.suffix}'
+    jacketDirectory = mgxcPath.resolve().parent
+    jacketPath = jacketDirectory / jacketFilename
+
+    try:
+        jacketDirectory.mkdir(parents=True, exist_ok=True)
+        with Image.open(sourcePath) as image:
+            width, height = image.size
+            side = min(width, height)
+            left = (width - side) // 2
+            top = (height - side) // 2
+            jacket = image.crop((left, top, left + side, top + side))
+            if imageExtension in ('.jpg', '.jpeg') and jacket.mode not in ('L', 'RGB'):
+                jacket = jacket.convert('RGB')
+            imageFormat = 'PNG' if imageExtension == '.png' else 'JPEG'
+            jacket.save(jacketPath, format=imageFormat)
+    except (OSError, ValueError) as error:
+        pErr(f'WARNING: unable to create jacket from {sourcePath}: {error}')
+        return ''
+
+    return jacketFilename
 
 
 def copyAssets(osuFilename, mgxcFilename, data):
@@ -162,6 +207,7 @@ def printNotes(timePoint1st: TimingPoint,
 def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop'):
     if data is None:
         data = OsuFile(osuFilename).parse_file()
+    jacketFilename = createJacket(osuFilename, mgxcFilename, data)
     copyAssets(osuFilename, mgxcFilename, data)
     keyCount = int(data.cs)
     tp1 = data.timing_points[0]
@@ -184,7 +230,7 @@ def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop
     pLine('BGM', data.audio_filename)
     pLine('BGMOFFSET', -tp1.offset / 1000)
     pLine('BGMPREVIEW', f'{previewStart:.5f}', f'{previewEnd:.5f}')
-    pLine('JACKET', '')
+    pLine('JACKET', jacketFilename)
     pLine('BG', getBackgroundFilename(osuFilename, data))
     pLine('BGSCENE', '')
     pLine('BGSYNC', '1')
@@ -210,16 +256,20 @@ def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop
 
 
 def convertFolder(inputFolder, outputFolder, genre=None):
-    inputDir = Path(inputFolder)
+    inputPath = Path(inputFolder)
     outputDir = Path(outputFolder)
     genre = getGenre(outputDir, genre)
-    if not inputDir.is_dir():
-        raise NotADirectoryError(inputDir)
-
-    osuFiles = sorted(
-        (path for path in inputDir.iterdir()
-         if path.is_file() and path.suffix.lower() == '.osu'),
-        key=lambda path: path.name.casefold())
+    if inputPath.is_file():
+        if inputPath.suffix.lower() != '.osu':
+            raise ValueError(f'input file must have a .osu extension: {inputPath}')
+        osuFiles = [inputPath]
+    elif inputPath.is_dir():
+        osuFiles = sorted(
+            (path for path in inputPath.iterdir()
+             if path.is_file() and path.suffix.lower() == '.osu'),
+            key=lambda path: path.name.casefold())
+    else:
+        raise FileNotFoundError(inputPath)
 
     charts = []
     for osuPath in osuFiles:
@@ -232,7 +282,7 @@ def convertFolder(inputFolder, outputFolder, genre=None):
     charts.sort(key=lambda chart: (len(chart[1].hit_objects),
                                    chart[0].name.casefold()))
     if not charts:
-        pErr(f'No osu!mania charts found in {inputDir}')
+        pErr(f'No osu!mania charts found in {inputPath}')
         return
 
     outputDir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +306,8 @@ mgxcFile = sys.stdout
 if __name__ == '__main__':
     if len(sys.argv) not in (3, 4):
         raise ValueError(
-            'usage: osu_mania_to_mgxc.py <input_folder> <output_folder> [genre]')
+            'usage: osu_mania_to_mgxc.py <input_folder_or_osu_file> '
+            '<output_folder> [genre]')
     genre = sys.argv[3] if len(sys.argv) == 4 else None
     convertFolder(sys.argv[1], sys.argv[2], genre)
 
