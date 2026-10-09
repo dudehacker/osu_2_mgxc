@@ -1,7 +1,5 @@
 from osupyparser import OsuFile
-import os
 import sys
-import subprocess
 from osupyparser.osu.objects import TimingPoint, HitObject
 import re
 import uuid
@@ -22,7 +20,7 @@ KEY_CNT_TO_KEY_WIDTH_MAPPING = {
 
 
 def pLine(*args):
-    print(*args, sep='\t', file=mgxcFile)
+    print(*args, sep='\t', file=ugcFile)
 
 
 def pErr(*args):
@@ -51,32 +49,6 @@ def getGenre(outputDir, genre):
     if outputDir.parent.name.casefold() == 'music':
         return outputDir.name
     return 'Jpop'
-
-
-def findUgctool(outputDir):
-    configuredPath = os.environ.get('UGCTOOL_PATH')
-    if configuredPath:
-        toolPath = Path(configuredPath)
-        if toolPath.is_file():
-            return toolPath
-        raise FileNotFoundError(f'UGCTOOL_PATH does not exist: {toolPath}')
-
-    for command in ('ugctool.exe', 'ugctool'):
-        toolPath = shutil.which(command)
-        if toolPath:
-            return Path(toolPath)
-
-    localTool = Path(__file__).resolve().parent / 'ugctool.exe'
-    if localTool.is_file():
-        return localTool
-
-    for parent in (outputDir.resolve(), *outputDir.resolve().parents):
-        tools = sorted(parent.glob('Margrete*/ugctool.exe'))
-        if tools:
-            return tools[0]
-
-    raise FileNotFoundError(
-        'Could not find ugctool.exe. Add it to PATH or set UGCTOOL_PATH.')
 
 
 def getBackgroundFilename(osuFilename, data):
@@ -167,123 +139,145 @@ def copyAssets(osuFilename, mgxcFilename, data):
 BEAT_TICK_LEN = 480
 
 
-def printTimePoints(timePoints: List[TimingPoint]):
-    bpms = set(tp.bpm for tp in timePoints if tp.bpm is not None)
+def getUgcTimingSections(timePoints):
+    orderedTimePoints = sorted(timePoints, key=lambda tp: tp.offset)
+    if not orderedTimePoints:
+        raise ValueError('osu! chart has no timing points')
 
-    if len(bpms) > 1:
-        raise ValueError('cannot support changing of BPM')
+    firstTimePoint = orderedTimePoints[0]
+    sections = [(0, 0, firstTimePoint.time_signature)]
+    sectionStartTick = 0
+    sectionStartBar = 0
+    currentSignature = firstTimePoint.time_signature
 
-    timePoints.sort(key=lambda tp: tp.offset)
-
-    tp1 = timePoints[0]
-
-    beatCount = 0.0
-    sectionCount = 0.0
-    for i, tp in enumerate(timePoints):
-        if i != len(timePoints) - 1:
-            nextTp = timePoints[i+1]
-        else:
-            nextTp = None
-
-        if i != 0:
-            lastTp = timePoints[i-1]
-        else:
-            lastTp = None
-
-        beatTick = round(beatCount * BEAT_TICK_LEN)
-
-        if lastTp is None or lastTp.time_signature != tp.time_signature:
-            if abs(sectionCount - round(sectionCount)) > 0.001:
-                pErr('WARNING: changing beat signature not at the begining of section')
-            else:
-                pLine('BEAT', round(sectionCount), tp.time_signature, '4')
-        if lastTp is None or lastTp.velocity != tp.velocity:
-            pLine('TIL', '0', beatTick, tp.velocity)
-
-        if nextTp is None:
+    for timePoint in orderedTimePoints[1:]:
+        tick = max(0, round((timePoint.offset - firstTimePoint.offset) /
+                            firstTimePoint.beat_length * BEAT_TICK_LEN))
+        if timePoint.time_signature == currentSignature:
             continue
 
-        durationMs = nextTp.offset - tp.offset
-        beatCount += durationMs / tp1.beat_length
-        sectionCount += durationMs / tp1.beat_length / tp.time_signature
-    pLine('BPM', '0', tp1.bpm)
+        ticksPerBar = currentSignature * BEAT_TICK_LEN
+        elapsedTicks = tick - sectionStartTick
+        bars, remainder = divmod(elapsedTicks, ticksPerBar)
+        if remainder:
+            pErr('WARNING: changing beat signature not at the beginning of a bar')
+            bars = round(elapsedTicks / ticksPerBar)
+
+        sectionStartBar += bars
+        sectionStartTick = tick
+        currentSignature = timePoint.time_signature
+        sections.append((tick, sectionStartBar, currentSignature))
+
+    return orderedTimePoints, sections
 
 
-def printNotes(timePoint1st: TimingPoint,
-               hitObjects: List[HitObject],
-               keyCount: int):
+def timeToUgcPosition(time, firstTimePoint, sections):
+    tick = max(0, round((time - firstTimePoint.offset) /
+                        firstTimePoint.beat_length * BEAT_TICK_LEN))
+    sectionStartTick, sectionStartBar, timeSignature = sections[0]
+    for section in sections[1:]:
+        if section[0] > tick:
+            break
+        sectionStartTick, sectionStartBar, timeSignature = section
 
+    barLength = timeSignature * BEAT_TICK_LEN
+    barOffset, tickInBar = divmod(tick - sectionStartTick, barLength)
+    return f'{sectionStartBar + barOffset}\'{tickInBar}', tick
+
+
+def printUgcTiming(timePoints, sections):
+    bpms = {tp.bpm for tp in timePoints if tp.bpm is not None}
+    if len(bpms) > 1:
+        raise ValueError('cannot support changing of BPM')
+    if not bpms:
+        raise ValueError('osu! chart has no BPM timing point')
+
+    firstTimePoint = timePoints[0]
+    for _, startBar, timeSignature in sections:
+        pLine('@BEAT', startBar, timeSignature, '4')
+
+    for timePoint in timePoints:
+        position, _ = timeToUgcPosition(
+            timePoint.offset, firstTimePoint, sections)
+        if timePoint.bpm is not None:
+            pLine('@BPM', position, f'{timePoint.bpm:.5f}')
+        if timePoint.velocity is not None:
+            pLine('@TIL', '0', position, f'{timePoint.velocity:.5f}')
+
+    mainBpm = next(tp.bpm for tp in timePoints if tp.bpm is not None)
+    pLine('@MAINTIL', '0')
+    pLine('@MAINBPM', f'{mainBpm:.5f}')
+
+
+def printUgcNotes(timePoint1st, sections, hitObjects, keyCount):
     keyWidthMapping = KEY_CNT_TO_KEY_WIDTH_MAPPING[keyCount]
 
-    def timeToTick(time): return max(0,
-                                     round((time - timePoint1st.offset) /
-                                           timePoint1st.beat_length * BEAT_TICK_LEN))
-    for o in hitObjects:
-        osuKeyPos = o.pos.x * keyCount // 512
-        chuKey = keyWidthMapping[osuKeyPos]
-        tick = timeToTick(o.start_time)
-        if o.type & 1:
-            pLine('t', 'N', 'N', 'N', tick,
-                  chuKey[0], chuKey[1], 8, 0, 0)
-        else:
-            pLine('s', 'BG', 'N', 'N', tick,
-                  chuKey[0], chuKey[1], 8, 0, 0)
-            pLine('.s', 'EN', 'N', 'N', timeToTick(int(o.additions.normal)),
-                  chuKey[0], chuKey[1], 8, 0, 0)
+    for hitObject in hitObjects:
+        osuKeyPos = hitObject.pos.x * keyCount // 512
+        laneStart, laneWidth = keyWidthMapping[osuKeyPos]
+        laneCode = f'{laneStart:X}{laneWidth:X}'
+        position, startTick = timeToUgcPosition(
+            hitObject.start_time, timePoint1st, sections)
+
+        if hitObject.type & 1:
+            pLine(f'#{position}:t{laneCode}')
+            continue
+
+        pLine(f'#{position}:s{laneCode}')
+        endTick = timeToUgcPosition(
+            int(hitObject.additions.normal), timePoint1st, sections)[1]
+        pLine(f'#{endTick - startTick}>s{laneCode}')
 
 
-def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop'):
+def osuManiaToUgc(osuFilename, ugcFilename, difficulty, data=None, genre='Jpop'):
     if data is None:
         data = OsuFile(osuFilename).parse_file()
-    jacketFilename = createJacket(osuFilename, mgxcFilename, data)
-    copyAssets(osuFilename, mgxcFilename, data)
-    keyCount = int(data.cs)
-    tp1 = data.timing_points[0]
+    jacketFilename = createJacket(osuFilename, ugcFilename, data)
+    copyAssets(osuFilename, ugcFilename, data)
+    timePoints, sections = getUgcTimingSections(data.timing_points)
+    firstTimePoint = timePoints[0]
     previewStart = data.preview_time / 1000
     previewEnd = previewStart + 20
 
-    pLine('MGCF0')
-    pLine('VERSION', '2')
-    pLine('BEGIN', 'META')
-    pLine('TITLE', data.title_unicode)
-    pLine('SORT', data.title)
     artistUnicode = data.artist_unicode
-    if data.source == 'この青空に約束を':
+    if data.source:
         artistUnicode = f'{artistUnicode} [{data.source}]'.strip()
-    pLine('ARTIST', artistUnicode)
-    pLine('GENRE', genre)
-    pLine('DESIGNER', data.creator)
-    pLine('DIFFICULTY', difficulty)
-    pLine('PLAYLEVEL', getLevel(data.version))
-    pLine('WEATTRIBUTE', '')
-    pLine('CHARTCONST', getLevel(data.version))
-    pLine('SONGID', str(uuid.uuid4()))
-    pLine('BGM', data.audio_filename)
-    pLine('BGMOFFSET', -tp1.offset / 1000)
-    pLine('BGMPREVIEW', f'{previewStart:.5f}', f'{previewEnd:.5f}')
-    pLine('JACKET', jacketFilename)
-    pLine('BG', getBackgroundFilename(osuFilename, data))
-    pLine('BGSCENE', '')
-    pLine('BGSYNC', '1')
-    pLine('FIELDCOL', '0')
-    pLine('FIELDBG', '')
-    pLine('FIELDSCENE', '')
-    pLine('MAINTIL', '0')
-    pLine('MAINBPM', tp1.bpm)
-    pLine('TUTORIAL', '0')
-    pLine('SOFFSET', '1')
-    pLine('USECLICK', '1')
-    pLine('EXLONG', '0')
-    pLine('BGMWAITEND', '0')
-    pLine('AUTHOR_LIST', '')
-    pLine('AUTHOR_SITES', '')
-    pLine('DLURL', '')
-    pLine('COPYRIGHT', '')
-    pLine('LICENSE', '', '')
-    pLine('BEGIN', 'HEADER')
-    printTimePoints(data.timing_points)
-    pLine('BEGIN', 'NOTES')
-    printNotes(tp1, data.hit_objects, keyCount)
+
+    pLine("' Created by osu_2_mgxc")
+    pLine('@VER', '8')
+    pLine('@EXVER', '1')
+    pLine('@TITLE', data.title_unicode)
+    pLine('@SORT', data.title)
+    pLine('@ARTIST', artistUnicode)
+    pLine('@GENRE', genre)
+    pLine('@DESIGN', data.creator)
+    pLine('@DIFF', difficulty)
+    pLine('@LEVEL', getLevel(data.version))
+    pLine('@CONST', f'{float(getLevel(data.version)):.5f}')
+    pLine('@SONGID', f'MGCF{uuid.uuid4().hex.upper()}')
+    pLine('@BGM', data.audio_filename)
+    pLine('@BGMOFS', f'{-firstTimePoint.offset / 1000:.5f}')
+    pLine('@BGMPRV', f'{previewStart:.5f}', f'{previewEnd:.5f}')
+    pLine('@JACKET', jacketFilename)
+    pLine('@BGIMG', getBackgroundFilename(osuFilename, data))
+    pLine('@BGMODE', 'PASSIVE', 'FALSE')
+    pLine('@FLDCOL', '-1')
+    pLine('@FLDIMG', '')
+    pLine('@FLAG', 'DIFFTTL', 'FALSE')
+    pLine('@FLAG', 'SOFFSET', 'TRUE')
+    pLine('@FLAG', 'CLICK', 'TRUE')
+    pLine('@FLAG', 'EXLONG', 'FALSE')
+    pLine('@FLAG', 'BGMWCMP', 'FALSE')
+    pLine('@FLAG', 'HIPRECISION', 'TRUE')
+    pLine('@ATINFO', 'AUTHORS', '')
+    pLine('@ATINFO', 'SITES', '')
+    pLine('@DLURL', '')
+    pLine('@COPYRIGHT', '')
+    pLine('@LICENSE', '', '')
+    pLine('@TICKS', BEAT_TICK_LEN)
+    printUgcTiming(timePoints, sections)
+    pLine('@ENDHEAD')
+    printUgcNotes(firstTimePoint, sections, data.hit_objects, int(data.cs))
 
 
 def convertFolder(inputFolder, outputFolder, genre=None):
@@ -316,28 +310,23 @@ def convertFolder(inputFolder, outputFolder, genre=None):
         pErr(f'No osu!mania charts found in {inputPath}')
         return
 
-    ugctoolPath = findUgctool(outputDir)
     outputDir.mkdir(parents=True, exist_ok=True)
-    global mgxcFile
+    global ugcFile
     for difficulty, (osuPath, data) in enumerate(charts):
         songTitle = data.title or data.title_unicode or 'Untitled'
         songArtist = data.artist or data.artist_unicode
         songFolderName = f'{songTitle} - {songArtist}' if songArtist else songTitle
         songDir = outputDir / getFolderName(songFolderName, 'Untitled')
         songDir.mkdir(parents=True, exist_ok=True)
-        mgxcPath = songDir / f'{osuPath.stem}.mgxc'
-        with mgxcPath.open('w', newline='', encoding='utf-8') as f:
-            mgxcFile = f
-            osuManiaToMgxc(osuPath, mgxcPath, difficulty, data, genre)
-        ugcPath = mgxcPath.with_suffix('.ugc')
-        subprocess.run(
-            [str(ugctoolPath), '-q', '-i', str(mgxcPath), str(ugcPath)],
-            check=True)
+        ugcPath = songDir / f'{osuPath.stem}.ugc'
+        with ugcPath.open('w', newline='', encoding='utf-8') as f:
+            ugcFile = f
+            osuManiaToUgc(osuPath, ugcPath, difficulty, data, genre)
         print(f'Converted {osuPath.name}: DIFFICULTY {difficulty}, '
               f'{len(data.hit_objects)} notes')
 
 
-mgxcFile = sys.stdout
+ugcFile = sys.stdout
 
 if __name__ == '__main__':
     if len(sys.argv) not in (3, 4):

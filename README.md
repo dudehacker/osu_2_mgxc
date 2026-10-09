@@ -29,6 +29,5 @@ Each chart's JPG or PNG background is center-cropped to a square for its
 jacket. The source extension is preserved, and the result is stored as
 `jacket.<extension>` in the song's output folder.
 
-Each generated `.mgxc` is also converted to a sibling `.ugc` file using
-Margrete's `ugctool`. The tool must be on `PATH`, available in a `Margrete*`
-folder above the output directory, or specified with `UGCTOOL_PATH`.
+The converter writes native `.ugc` files directly and does not create `.mgxc`
+files or require Margrete's `ugctool`.
