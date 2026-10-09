@@ -111,6 +111,7 @@ def osuManiaToMgxc(osuFilename):
     pLine('VERSION', '2')
     pLine('BEGIN', 'META')
     pLine('TITLE', data.title_unicode)
+    pLine('SORT', data.title)
     pLine('ARTIST', data.artist_unicode)
     pLine('DESIGNER', data.creator)
     pLine('DIFFICULTY', '3')
@@ -155,7 +156,7 @@ if __name__ == '__main__':
     osuFilename = sys.argv[1]
     mgxcFilename = sys.argv[2]
     # osuFilename = '.\_icerain6k.osu'
-    with open(mgxcFilename, 'w', newline='') as f:
+    with open(mgxcFilename, 'w', newline='', encoding='utf-8') as f:
         mgxcFile = f
         osuManiaToMgxc(osuFilename)
 
