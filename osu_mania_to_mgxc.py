@@ -1,5 +1,7 @@
 from osupyparser import OsuFile
+import os
 import sys
+import subprocess
 from osupyparser.osu.objects import TimingPoint, HitObject
 import re
 import uuid
@@ -49,6 +51,32 @@ def getGenre(outputDir, genre):
     if outputDir.parent.name.casefold() == 'music':
         return outputDir.name
     return 'Jpop'
+
+
+def findUgctool(outputDir):
+    configuredPath = os.environ.get('UGCTOOL_PATH')
+    if configuredPath:
+        toolPath = Path(configuredPath)
+        if toolPath.is_file():
+            return toolPath
+        raise FileNotFoundError(f'UGCTOOL_PATH does not exist: {toolPath}')
+
+    for command in ('ugctool.exe', 'ugctool'):
+        toolPath = shutil.which(command)
+        if toolPath:
+            return Path(toolPath)
+
+    localTool = Path(__file__).resolve().parent / 'ugctool.exe'
+    if localTool.is_file():
+        return localTool
+
+    for parent in (outputDir.resolve(), *outputDir.resolve().parents):
+        tools = sorted(parent.glob('Margrete*/ugctool.exe'))
+        if tools:
+            return tools[0]
+
+    raise FileNotFoundError(
+        'Could not find ugctool.exe. Add it to PATH or set UGCTOOL_PATH.')
 
 
 def getBackgroundFilename(osuFilename, data):
@@ -219,7 +247,10 @@ def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop
     pLine('BEGIN', 'META')
     pLine('TITLE', data.title_unicode)
     pLine('SORT', data.title)
-    pLine('ARTIST', data.artist_unicode)
+    artistUnicode = data.artist_unicode
+    if data.source == 'この青空に約束を':
+        artistUnicode = f'{artistUnicode} [{data.source}]'.strip()
+    pLine('ARTIST', artistUnicode)
     pLine('GENRE', genre)
     pLine('DESIGNER', data.creator)
     pLine('DIFFICULTY', difficulty)
@@ -285,6 +316,7 @@ def convertFolder(inputFolder, outputFolder, genre=None):
         pErr(f'No osu!mania charts found in {inputPath}')
         return
 
+    ugctoolPath = findUgctool(outputDir)
     outputDir.mkdir(parents=True, exist_ok=True)
     global mgxcFile
     for difficulty, (osuPath, data) in enumerate(charts):
@@ -297,6 +329,10 @@ def convertFolder(inputFolder, outputFolder, genre=None):
         with mgxcPath.open('w', newline='', encoding='utf-8') as f:
             mgxcFile = f
             osuManiaToMgxc(osuPath, mgxcPath, difficulty, data, genre)
+        ugcPath = mgxcPath.with_suffix('.ugc')
+        subprocess.run(
+            [str(ugctoolPath), '-q', '-i', str(mgxcPath), str(ugcPath)],
+            check=True)
         print(f'Converted {osuPath.name}: DIFFICULTY {difficulty}, '
               f'{len(data.hit_objects)} notes')
 
