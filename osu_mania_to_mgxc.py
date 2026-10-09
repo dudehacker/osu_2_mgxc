@@ -3,6 +3,8 @@ import sys
 from osupyparser.osu.objects import TimingPoint, HitObject
 import re
 import uuid
+import shutil
+from pathlib import Path
 from typing import List, Dict, Tuple
 KEY_CNT_TO_KEY_WIDTH_MAPPING = {
     1: {0: (0, 16)},
@@ -25,6 +27,7 @@ def pErr(*args):
 
 
 LV_REGEX = re.compile(r'.*\[(\d\d?)\].*')
+INVALID_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def getLevel(version):
@@ -32,6 +35,60 @@ def getLevel(version):
     if m:
         return m[1]
     return '1'
+
+
+def getFolderName(title, fallback):
+    folderName = INVALID_FOLDER_CHARS.sub('_', title).strip().rstrip('.')
+    return folderName or fallback
+
+
+def getGenre(outputDir, genre):
+    if genre and genre.strip():
+        return genre.strip()
+    if outputDir.parent.name.casefold() == 'music':
+        return outputDir.name
+    return 'Jpop'
+
+
+def getBackgroundFilename(osuFilename, data):
+    sourceDir = Path(osuFilename).resolve().parent
+    videoFilename = data.video_file if data.has_video else ''
+    if videoFilename:
+        videoPath = Path(videoFilename)
+        if (not videoPath.is_absolute() and '..' not in videoPath.parts and
+                (sourceDir / videoPath).is_file()):
+            return videoFilename
+    return data.background_file
+
+
+def copyAssets(osuFilename, mgxcFilename, data):
+    sourceDir = Path(osuFilename).resolve().parent
+    outputDir = Path(mgxcFilename).resolve().parent
+    backgroundFilename = getBackgroundFilename(osuFilename, data)
+    if data.has_video and data.video_file and backgroundFilename != data.video_file:
+        pErr(f'WARNING: video file not found: {data.video_file}')
+
+    assets = [data.audio_filename, backgroundFilename]
+
+    for assetFilename in assets:
+        if not assetFilename:
+            continue
+
+        assetPath = Path(assetFilename)
+        if assetPath.is_absolute() or '..' in assetPath.parts:
+            pErr(f'WARNING: skipping unsafe asset path: {assetFilename}')
+            continue
+
+        sourcePath = sourceDir / assetPath
+        outputPath = outputDir / assetPath
+        if not sourcePath.is_file():
+            pErr(f'WARNING: asset file not found: {sourcePath}')
+            continue
+        if sourcePath.resolve() == outputPath.resolve():
+            continue
+
+        outputPath.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sourcePath, outputPath)
 
 
 BEAT_TICK_LEN = 480
@@ -102,10 +159,14 @@ def printNotes(timePoint1st: TimingPoint,
                   chuKey[0], chuKey[1], 8, 0, 0)
 
 
-def osuManiaToMgxc(osuFilename):
-    data = OsuFile(osuFilename).parse_file()
+def osuManiaToMgxc(osuFilename, mgxcFilename, difficulty, data=None, genre='Jpop'):
+    if data is None:
+        data = OsuFile(osuFilename).parse_file()
+    copyAssets(osuFilename, mgxcFilename, data)
     keyCount = int(data.cs)
     tp1 = data.timing_points[0]
+    previewStart = data.preview_time / 1000
+    previewEnd = previewStart + 20
 
     pLine('MGCF0')
     pLine('VERSION', '2')
@@ -113,17 +174,18 @@ def osuManiaToMgxc(osuFilename):
     pLine('TITLE', data.title_unicode)
     pLine('SORT', data.title)
     pLine('ARTIST', data.artist_unicode)
+    pLine('GENRE', genre)
     pLine('DESIGNER', data.creator)
-    pLine('DIFFICULTY', '3')
+    pLine('DIFFICULTY', difficulty)
     pLine('PLAYLEVEL', getLevel(data.version))
     pLine('WEATTRIBUTE', '')
     pLine('CHARTCONST', getLevel(data.version))
     pLine('SONGID', str(uuid.uuid4()))
     pLine('BGM', data.audio_filename)
     pLine('BGMOFFSET', -tp1.offset / 1000)
-    pLine('BGMPREVIEW', '0.00000', '15.00000')
+    pLine('BGMPREVIEW', f'{previewStart:.5f}', f'{previewEnd:.5f}')
     pLine('JACKET', '')
-    pLine('BG', data.background_file)
+    pLine('BG', getBackgroundFilename(osuFilename, data))
     pLine('BGSCENE', '')
     pLine('BGSYNC', '1')
     pLine('FIELDCOL', '0')
@@ -147,18 +209,56 @@ def osuManiaToMgxc(osuFilename):
     printNotes(tp1, data.hit_objects, keyCount)
 
 
+def convertFolder(inputFolder, outputFolder, genre=None):
+    inputDir = Path(inputFolder)
+    outputDir = Path(outputFolder)
+    genre = getGenre(outputDir, genre)
+    if not inputDir.is_dir():
+        raise NotADirectoryError(inputDir)
+
+    osuFiles = sorted(
+        (path for path in inputDir.iterdir()
+         if path.is_file() and path.suffix.lower() == '.osu'),
+        key=lambda path: path.name.casefold())
+
+    charts = []
+    for osuPath in osuFiles:
+        data = OsuFile(str(osuPath)).parse_file()
+        if data.mode != 3:
+            pErr(f'Skipping non-mania chart: {osuPath.name}')
+            continue
+        charts.append((osuPath, data))
+
+    charts.sort(key=lambda chart: (len(chart[1].hit_objects),
+                                   chart[0].name.casefold()))
+    if not charts:
+        pErr(f'No osu!mania charts found in {inputDir}')
+        return
+
+    outputDir.mkdir(parents=True, exist_ok=True)
+    global mgxcFile
+    for difficulty, (osuPath, data) in enumerate(charts):
+        songTitle = data.title or data.title_unicode or 'Untitled'
+        songArtist = data.artist or data.artist_unicode
+        songFolderName = f'{songTitle} - {songArtist}' if songArtist else songTitle
+        songDir = outputDir / getFolderName(songFolderName, 'Untitled')
+        songDir.mkdir(parents=True, exist_ok=True)
+        mgxcPath = songDir / f'{osuPath.stem}.mgxc'
+        with mgxcPath.open('w', newline='', encoding='utf-8') as f:
+            mgxcFile = f
+            osuManiaToMgxc(osuPath, mgxcPath, difficulty, data, genre)
+        print(f'Converted {osuPath.name}: DIFFICULTY {difficulty}, '
+              f'{len(data.hit_objects)} notes')
+
+
 mgxcFile = sys.stdout
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
+    if len(sys.argv) not in (3, 4):
         raise ValueError(
-            f'require 3 parameters but got {len(sys.argv) - 1} only')
-    osuFilename = sys.argv[1]
-    mgxcFilename = sys.argv[2]
-    # osuFilename = '.\_icerain6k.osu'
-    with open(mgxcFilename, 'w', newline='', encoding='utf-8') as f:
-        mgxcFile = f
-        osuManiaToMgxc(osuFilename)
+            'usage: osu_mania_to_mgxc.py <input_folder> <output_folder> [genre]')
+    genre = sys.argv[3] if len(sys.argv) == 4 else None
+    convertFolder(sys.argv[1], sys.argv[2], genre)
 
 a = [
     TimingPoint(
