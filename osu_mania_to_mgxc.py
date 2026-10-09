@@ -96,9 +96,9 @@ def printNotes(timePoint1st: TimingPoint,
             pLine('t', 'N', 'N', 'N', tick,
                   chuKey[0], chuKey[1], 8, 0, 0)
         else:
-            pLine('h', 'BG', 'N', 'N', tick,
+            pLine('s', 'BG', 'N', 'N', tick,
                   chuKey[0], chuKey[1], 8, 0, 0)
-            pLine('.h', 'EN', 'N', 'N', timeToTick(int(o.additions.normal)),
+            pLine('.s', 'EN', 'N', 'N', timeToTick(int(o.additions.normal)),
                   chuKey[0], chuKey[1], 8, 0, 0)
 
 
